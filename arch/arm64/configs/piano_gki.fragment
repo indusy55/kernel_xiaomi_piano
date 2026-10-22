@@ -3,34 +3,65 @@
 # The stock GKI 6.6.118 kernel on this device is built with
 #
 #     # CONFIG_VT is not set
-#     # CONFIG_FB is not set
 #
-# so there is no virtual terminal, no framebuffer console and no boot logo.
-# That is fine for Android (SurfaceFlinger draws everything and the display
-# HAL drives the panel), but it blocks two things on the Linux side:
+# so there is no virtual terminal and no /dev/tty0.  That is fine for Android,
+# but it blocks one thing on the Linux side: KWin / weston / sway cannot use
+# their DRM backend.  libseat insists on opening /dev/tty0 to bind the session
+# to a VT, and with no VT support the kernel never creates that node, so the
+# compositor aborts with "Could not open tty0" / "Failed to open VT".
 #
-#   * KWin / weston / sway cannot use their DRM backend.  libseat insists on
-#     opening /dev/tty0 to bind the session to a VT, and with no VT support
-#     the kernel never creates that node, so the compositor aborts with
-#     "Could not open tty0" / "Failed to open VT".
-#   * Nothing can draw before the userspace compositor starts, so a failed
-#     boot leaves a blank panel with no diagnostics.
+# Applied on top of the device's own config so the shipped baseline stays
+# untouched:
 #
-# This fragment turns on the console stack and the boot logo.  It is applied
-# on top of gki_defconfig so the official GKI baseline stays untouched, the
-# same way amlogic_gki.fragment / db845c_gki.fragment / rockpi4_gki.fragment
-# are used:
-#
-#     make ARCH=arm64 gki_defconfig
+#     cp /proc/config.gz-derived config to .config
+#     make ARCH=arm64 olddefconfig
 #     scripts/kconfig/merge_config.sh -m .config \
 #         arch/arm64/configs/piano_gki.fragment
 #     make ARCH=arm64 olddefconfig
 #
-# Keep this file limited to options that are *not* already in gki_defconfig;
-# everything here is additive.
+# ---------------------------------------------------------------------------
+# Why only VT, and not fbcon / the boot logo
+# ---------------------------------------------------------------------------
+#
+# Turning on CONFIG_FB + CONFIG_FRAMEBUFFER_CONSOLE + CONFIG_DRM_FBDEV_EMULATION
+# + CONFIG_LOGO produces a kernel that boots and creates /dev/tty0, but Android
+# then never comes up: SurfaceFlinger dies in a crash loop with
+#
+#     SDM: HWInfoDRM::Init: Failed to acquire DRMMaster instance 0
+#     SurfaceFlinger: Initial display configuration failed: HWC did not hotplug
+#
+# The cause is not vermagic but symbol CRCs.  CONFIG_MODVERSIONS=y makes the
+# module loader compare every symbol CRC in the module's __versions section
+# against the kernel's.  DRM_FBDEV_EMULATION changes the layout of struct
+# drm_device / drm_framebuffer, which changes the CRC of every DRM symbol, so
+# msm_drm.ko refuses to load:
+#
+#     msm_drm: disagrees about version of symbol drm_panel_init
+#     msm_drm: disagrees about version of symbol backlight_device_register
+#
+# Measured on this device:
+#
+#     symbol                            with FBDEV    without     vendor expects
+#     backlight_device_register         0x1a91d54c    0x2dbddc88  0x2dbddc88
+#     drm_panel_init                    0x9b7c3085    0xac1477ea  0xac1477ea
+#     drm_helper_mode_fill_fb_struct    0x60cf208e    0xbe13fdf0  0xbe13fdf0
+#     module_layout                     0x4e276f37    0x4e276f37  0x4e276f37
+#
+# Note module_layout matches either way: the base ABI is fine and vermagic is
+# irrelevant here.  Only the DRM symbols move.
+#
+# CONFIG_VT on its own touches no DRM structure at all, so /dev/tty0 appears
+# and Android boots normally.
+#
+# The cost is that kernel log output during boot is no longer drawn on the
+# panel.  On this device that was never going to work anyway: boot goes through
+# Android, where composer/SurfaceFlinger owns the display, and the panel is a
+# dual-DSI 1600x2136 half-panel that plain fbcon would not drive correctly.
+# Use ramoops instead (already configured on this device, 2 MB console buffer,
+# readable from /sys/fs/pstore/ after a reboot), or kmscon on the Linux side.
 
 # --- virtual terminal -------------------------------------------------------
-# Required by libseat-based compositors and by fbcon.
+# This is the whole point: CONFIG_VT is what creates /dev/tty0 .. /dev/tty63.
 CONFIG_VT=y
 CONFIG_VT_CONSOLE=y
 CONFIG_HW_CONSOLE=y
@@ -39,53 +70,34 @@ CONFIG_DUMMY_CONSOLE=y
 # is self-contained if it is ever merged into a different baseline.
 CONFIG_UNIX98_PTYS=y
 
-# --- framebuffer core + fbcon ----------------------------------------------
-# CONFIG_FB is the legacy fbdev core and is the *hard* dependency of
-# FRAMEBUFFER_CONSOLE: without it fbcon has no fbdev to register a console on
-# and the whole VT stack is dead weight.  Enabling FRAMEBUFFER_CONSOLE alone
-# produces a kernel that builds fine, boots fine, and still has no /dev/tty0 --
-# which is exactly what happened the first time this fragment was tried.
-CONFIG_FB=y
-CONFIG_FB_DEVICE=y
-CONFIG_FB_NOTIFY=y
-CONFIG_FB_CORE=y
-CONFIG_FRAMEBUFFER_CONSOLE=y
-CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
-# fbcon refuses to start unless at least one built-in font exists.  Keep this
-# identical to the known-booting kernel_platform build: one fixed 8x8 font and
-# no font selector, rather than FONTS=y with a variable list.
-CONFIG_FONT_8x8=y
-# CONFIG_FONTS is not set
-# CONFIG_FONT_TER16x32 is not set
-# CONFIG_FRAMEBUFFER_CONSOLE_ROTATION is not set
+# --- deliberately left off --------------------------------------------------
+# Each of these drags in the fbdev core and/or changes DRM structure layout,
+# which breaks msm_drm.ko's symbol CRCs.  See the long comment above.
+# CONFIG_FB is not set
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+# CONFIG_DRM_FBDEV_EMULATION is not set
+# CONFIG_LOGO is not set
 
-# --- DRM fbdev emulation ----------------------------------------------------
-# This is what gives the msm_drm / DRM stack a /dev/fb0 and lets fbcon paint
-# on it.  Without it FRAMEBUFFER_CONSOLE has nothing to bind to.
-CONFIG_DRM_FBDEV_EMULATION=y
-
-# --- boot logo --------------------------------------------------------------
-CONFIG_LOGO=y
-CONFIG_LOGO_LINUX_MONO=y
-CONFIG_LOGO_LINUX_VGA16=y
-CONFIG_LOGO_LINUX_CLUT224=y
+# --- do not trim exported symbols -------------------------------------------
+# Android GKI defaults to CONFIG_TRIM_UNUSED_KSYMS=y with the whitelist
+# abi_symbollist.raw, a file that Kleaf generates from the real ABI definition.
+# This tree has no Kleaf step, so the file would have to be faked -- and a
+# hand-assembled whitelist is nowhere near complete.  Measured: trimming drops
+# the kernel from 16579 exported symbols to 3576, and every vendor_dlkm module
+# that links against a dropped symbol then fails to load.  The known-booting
+# kernel_platform build has trimming off, so match it.
+# CONFIG_TRIM_UNUSED_KSYMS is not set
 
 # --- kernel release string ---------------------------------------------------
-# The vendor modules on this device are built against the exact release string
+# The vendor modules on this device were built against the exact release string
 # of the shipped GKI kernel:
 #
 #   6.6.118-android15-8-gf72a02f47f4b-abogki551678766-4k
 #
-# vermagic is checked by the module loader, so a differently named kernel
-# refuses to load every vendor_dlkm module (touch, audio, Wi-Fi, camera, ...).
-# Reproduce the string exactly:
-#
-#   * LOCALVERSION carries the whole suffix, including the ABO build number
-#   * LOCALVERSION_AUTO must stay off, otherwise scripts/setlocalversion
-#     appends "-<commits>-g<sha>" of *this* tree and the name diverges
-#
-# Only needed when building against a tree whose git history differs from the
-# ABO build; harmless otherwise.
+# Pinning it keeps uname -r and dmesg comparable with the stock kernel.  It is
+# NOT required for module loading: kernel/module/version.c's same_magic() skips
+# everything up to the first space when the module carries CRCs, so only
+# "SMP preempt mod_unload modversions aarch64" is actually compared.
 CONFIG_LOCALVERSION="-android15-8-gf72a02f47f4b-abogki551678766-4k"
 # CONFIG_LOCALVERSION_AUTO is not set
 
@@ -105,16 +117,15 @@ CONFIG_LOCALVERSION="-android15-8-gf72a02f47f4b-abogki551678766-4k"
 #
 #     6.6.118-android15-8-gf72a02f47f4b-abogki551678766-4k+
 #
-# which does not match vermagic and breaks every vendor module.  Passing
-# LOCALVERSION= on the command line counts as "set" and suppresses the "+":
+# Passing LOCALVERSION= on the command line counts as "set" and suppresses the
+# "+".  Harmless either way (same_magic ignores the prefix), but it keeps
+# uname -r tidy:
 #
-#     make ARCH=arm64 CC=clang LLVM=1 LOCALVERSION= -j8 Image modules
-
-# --- do not trim exported symbols -------------------------------------------
-# Android GKI defaults to CONFIG_TRIM_UNUSED_KSYMS=y with the whitelist
-# abi_symbollist.raw, a file that Kleaf generates from the real ABI definition.
-# This tree has no Kleaf step, so the file would have to be faked -- and an
-# empty whitelist trims every exported symbol the vendor_dlkm modules link
-# against, which is fatal for touch/audio/Wi-Fi/camera.  The known-booting
-# kernel_platform build has trimming off, so match it.
-# CONFIG_TRIM_UNUSED_KSYMS is not set
+#     make ARCH=arm64 CC=clang LLVM=1 LOCALVERSION= -j8 Image
+#
+# Also note: after editing CONFIG_LOCALVERSION, include/config/auto.conf is
+# stale and kernelrelease keeps the old value.  Clear it:
+#
+#     rm -f include/config/auto.conf include/config/auto.conf.cmd \
+#           include/config/kernel.release
+#     make ARCH=arm64 CC=clang LLVM=1 LOCALVERSION= syncconfig

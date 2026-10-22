@@ -1,0 +1,120 @@
+# Piano (Xiaomi Pad 8 Pro) kernel config fragment
+#
+# The stock GKI 6.6.118 kernel on this device is built with
+#
+#     # CONFIG_VT is not set
+#     # CONFIG_FB is not set
+#
+# so there is no virtual terminal, no framebuffer console and no boot logo.
+# That is fine for Android (SurfaceFlinger draws everything and the display
+# HAL drives the panel), but it blocks two things on the Linux side:
+#
+#   * KWin / weston / sway cannot use their DRM backend.  libseat insists on
+#     opening /dev/tty0 to bind the session to a VT, and with no VT support
+#     the kernel never creates that node, so the compositor aborts with
+#     "Could not open tty0" / "Failed to open VT".
+#   * Nothing can draw before the userspace compositor starts, so a failed
+#     boot leaves a blank panel with no diagnostics.
+#
+# This fragment turns on the console stack and the boot logo.  It is applied
+# on top of gki_defconfig so the official GKI baseline stays untouched, the
+# same way amlogic_gki.fragment / db845c_gki.fragment / rockpi4_gki.fragment
+# are used:
+#
+#     make ARCH=arm64 gki_defconfig
+#     scripts/kconfig/merge_config.sh -m .config \
+#         arch/arm64/configs/piano_gki.fragment
+#     make ARCH=arm64 olddefconfig
+#
+# Keep this file limited to options that are *not* already in gki_defconfig;
+# everything here is additive.
+
+# --- virtual terminal -------------------------------------------------------
+# Required by libseat-based compositors and by fbcon.
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_HW_CONSOLE=y
+CONFIG_DUMMY_CONSOLE=y
+# UNIX98 ptys are already enabled in gki_defconfig; restated so this fragment
+# is self-contained if it is ever merged into a different baseline.
+CONFIG_UNIX98_PTYS=y
+
+# --- framebuffer core + fbcon ----------------------------------------------
+# CONFIG_FB is the legacy fbdev core and is the *hard* dependency of
+# FRAMEBUFFER_CONSOLE: without it fbcon has no fbdev to register a console on
+# and the whole VT stack is dead weight.  Enabling FRAMEBUFFER_CONSOLE alone
+# produces a kernel that builds fine, boots fine, and still has no /dev/tty0 --
+# which is exactly what happened the first time this fragment was tried.
+CONFIG_FB=y
+CONFIG_FB_DEVICE=y
+CONFIG_FB_NOTIFY=y
+CONFIG_FB_CORE=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+# fbcon refuses to start unless at least one built-in font exists.  Keep this
+# identical to the known-booting kernel_platform build: one fixed 8x8 font and
+# no font selector, rather than FONTS=y with a variable list.
+CONFIG_FONT_8x8=y
+# CONFIG_FONTS is not set
+# CONFIG_FONT_TER16x32 is not set
+# CONFIG_FRAMEBUFFER_CONSOLE_ROTATION is not set
+
+# --- DRM fbdev emulation ----------------------------------------------------
+# This is what gives the msm_drm / DRM stack a /dev/fb0 and lets fbcon paint
+# on it.  Without it FRAMEBUFFER_CONSOLE has nothing to bind to.
+CONFIG_DRM_FBDEV_EMULATION=y
+
+# --- boot logo --------------------------------------------------------------
+CONFIG_LOGO=y
+CONFIG_LOGO_LINUX_MONO=y
+CONFIG_LOGO_LINUX_VGA16=y
+CONFIG_LOGO_LINUX_CLUT224=y
+
+# --- kernel release string ---------------------------------------------------
+# The vendor modules on this device are built against the exact release string
+# of the shipped GKI kernel:
+#
+#   6.6.118-android15-8-gf72a02f47f4b-abogki551678766-4k
+#
+# vermagic is checked by the module loader, so a differently named kernel
+# refuses to load every vendor_dlkm module (touch, audio, Wi-Fi, camera, ...).
+# Reproduce the string exactly:
+#
+#   * LOCALVERSION carries the whole suffix, including the ABO build number
+#   * LOCALVERSION_AUTO must stay off, otherwise scripts/setlocalversion
+#     appends "-<commits>-g<sha>" of *this* tree and the name diverges
+#
+# Only needed when building against a tree whose git history differs from the
+# ABO build; harmless otherwise.
+CONFIG_LOCALVERSION="-android15-8-gf72a02f47f4b-abogki551678766-4k"
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# IMPORTANT: pass LOCALVERSION= (empty) on the make command line.
+#
+# scripts/setlocalversion has this at the end:
+#
+#     elif [ "${LOCALVERSION+set}" != "set" ]; then
+#             # If the variable LOCALVERSION is not set, append a plus sign
+#             scm_version="$(scm_version --short)"
+#     fi
+#
+# CONFIG_LOCALVERSION (the .config symbol) is NOT the make variable
+# LOCALVERSION.  If the make variable is unset, setlocalversion appends a
+# literal "+" to the release string -- and since this tree is a shallow import
+# with no reachable tags, it always takes that path.  The result is
+#
+#     6.6.118-android15-8-gf72a02f47f4b-abogki551678766-4k+
+#
+# which does not match vermagic and breaks every vendor module.  Passing
+# LOCALVERSION= on the command line counts as "set" and suppresses the "+":
+#
+#     make ARCH=arm64 CC=clang LLVM=1 LOCALVERSION= -j8 Image modules
+
+# --- do not trim exported symbols -------------------------------------------
+# Android GKI defaults to CONFIG_TRIM_UNUSED_KSYMS=y with the whitelist
+# abi_symbollist.raw, a file that Kleaf generates from the real ABI definition.
+# This tree has no Kleaf step, so the file would have to be faked -- and an
+# empty whitelist trims every exported symbol the vendor_dlkm modules link
+# against, which is fatal for touch/audio/Wi-Fi/camera.  The known-booting
+# kernel_platform build has trimming off, so match it.
+# CONFIG_TRIM_UNUSED_KSYMS is not set
